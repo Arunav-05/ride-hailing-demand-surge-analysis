@@ -9,7 +9,7 @@
 - Data dictionary: https://home4.nyc.gov/assets/tlc/downloads/pdf/data_dictionary_trip_records_hvfhs.pdf
 
 ## Access plan
-The R Markdown notebook uses the public Socrata JSON API without credentials. It queries January 1–8, 2024, selects only necessary fields and caps the response at 500,000 records. It records the query, extraction timestamp, returned row count and data-quality results. Raw data is downloaded at runtime and is not committed to Git.
+The R Markdown notebook uses the public Socrata JSON API without credentials. It queries January 1–8, 2024, selects only necessary fields and uses pages of 50,000 records with a safety ceiling of 5 million records; the notebook flags the extraction if that ceiling is reached. It records the query, extraction timestamp, returned row count and data-quality results. Raw data is downloaded at runtime and is not committed to Git.
 
 ## Relevant fields
 | Field | Meaning | Use |
