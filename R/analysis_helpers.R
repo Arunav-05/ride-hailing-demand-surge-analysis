@@ -1,47 +1,74 @@
-# Reusable helper functions for the project
+# Reusable helper functions for NYC Ride-Hailing Demand & Surge Pricing Analysis
 
-clean_hvfhv <- function(data) {
-  stopifnot(all(c("request_datetime", "PULocationID", "hvfhs_license_num") %in% names(data)))
-  data |>
-    dplyr::mutate(
-      request_datetime = lubridate::ymd_hms(request_datetime, quiet = TRUE, tz = "America/New_York"),
-      pickup_zone = as.integer(PULocationID),
-      provider = as.character(hvfhs_license_num),
-      trip_miles = suppressWarnings(as.numeric(trip_miles)),
-      base_passenger_fare = suppressWarnings(as.numeric(base_passenger_fare)),
-      driver_pay = suppressWarnings(as.numeric(driver_pay))
-    ) |>
-    dplyr::filter(!is.na(request_datetime), !is.na(pickup_zone), pickup_zone > 0)
+#' Fetch one day of aggregated HVFHV data from the NYC Open Data SODA API
+#' @param day Date string or Date object (YYYY-MM-DD)
+#' @param api_url SODA API endpoint URL
+#' @param retries Number of retry attempts
+#' @return A data.frame with hourly aggregated trip metrics
+fetch_one_day <- function(day,
+                          api_url = "https://data.cityofnewyork.us/resource/bqxa-629f.json",
+                          retries = 3) {
+  day <- as.Date(day)
+  q <- list(
+    `$select` = paste(
+      "pulocationid,",
+      "date_extract_hh(request_datetime) as hr,",
+      "count(*) as trips,",
+      "sum(trip_miles) as miles,",
+      "sum(base_passenger_fare) as fare_sum"
+    ),
+    `$where`  = sprintf("request_datetime >= '%sT00:00:00' AND request_datetime < '%sT00:00:00'",
+                        day, day + 1),
+    `$group`  = "pulocationid, hr",
+    `$limit`  = 50000
+  )
+  for (i in seq_len(retries)) {
+    resp <- try(httr::GET(api_url, query = q, httr::timeout(180)), silent = TRUE)
+    if (!inherits(resp, "try-error") && httr::status_code(resp) == 200) {
+      out <- jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8"))
+      if (length(out) == 0) return(NULL)
+      out$day <- day
+      return(out)
+    }
+    Sys.sleep(3 * i)
+  }
+  stop("API request failed for ", day, ". Check network connectivity or API status.")
 }
 
-make_hourly_zone_panel <- function(data) {
-  hourly <- data |>
-    dplyr::mutate(hour = lubridate::floor_date(request_datetime, "hour")) |>
-    dplyr::count(pickup_zone, hour, name = "trips")
-  zones <- sort(unique(hourly$pickup_zone))
-  hours <- seq(min(hourly$hour), max(hourly$hour), by = "hour")
-  tidyr::expand_grid(pickup_zone = zones, hour = hours) |>
-    dplyr::left_join(hourly, by = c("pickup_zone", "hour")) |>
-    dplyr::mutate(trips = tidyr::replace_na(trips, 0L)) |>
-    dplyr::arrange(pickup_zone, hour) |>
-    dplyr::group_by(pickup_zone) |>
-    dplyr::mutate(
-      hour_of_day = lubridate::hour(hour),
-      weekday = factor(lubridate::wday(hour, label = TRUE, week_start = 1)),
-      weekend = lubridate::wday(hour, week_start = 1) >= 6,
-      lag_1 = dplyr::lag(trips, 1),
-      lag_24 = dplyr::lag(trips, 24),
-      rolling_24 = dplyr::lag(slider::slide_dbl(trips, mean, .before = 23, .complete = TRUE), 1)
-    ) |>
-    dplyr::ungroup() |>
-    dplyr::filter(!is.na(lag_24), !is.na(rolling_24))
+#' Root Mean Squared Error (RMSE)
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2, na.rm = TRUE))
 }
 
+#' Mean Absolute Error (MAE)
+mae <- function(actual, predicted) {
+  mean(abs(actual - predicted), na.rm = TRUE)
+}
+
+#' Volume-Weighted Absolute Percentage Error (WAPE)
+wape <- function(actual, predicted) {
+  sum(abs(actual - predicted), na.rm = TRUE) / max(sum(actual, na.rm = TRUE), .Machine$double.eps)
+}
+
+#' Score forecast models using standard metrics
 score_forecast <- function(actual, predicted) {
   tibble::tibble(
-    MAE = mean(abs(actual - predicted), na.rm = TRUE),
-    RMSE = sqrt(mean((actual - predicted)^2, na.rm = TRUE)),
-    WAPE = sum(abs(actual - predicted), na.rm = TRUE) /
-      max(sum(actual, na.rm = TRUE), .Machine$double.eps)
+    RMSE = rmse(actual, predicted),
+    MAE  = mae(actual, predicted),
+    WAPE = wape(actual, predicted)
   )
+}
+
+#' Evaluate Top-K zone demand capture rate for driver positioning
+#' @param data Test data.frame containing actual demand `y` and prediction column `pred_col`
+#' @param pred_col Name of column containing model predictions
+#' @param k Number of top zones recommended
+#' @return Mean share of total demand captured across all test time periods
+evaluate_positioning_rule <- function(data, pred_col, k = 10) {
+  data %>%
+    dplyr::group_by(target_ts) %>%
+    dplyr::mutate(rk = rank(-.data[[pred_col]], ties.method = "first")) %>%
+    dplyr::summarise(capture = sum(y[rk <= k], na.rm = TRUE) / sum(y, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::summarise(mean_capture = mean(capture, na.rm = TRUE)) %>%
+    dplyr::pull(mean_capture)
 }
