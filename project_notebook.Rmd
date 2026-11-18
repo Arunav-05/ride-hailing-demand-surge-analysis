@@ -102,8 +102,11 @@ selected_fields <- c(
 )
 where_clause <- "request_datetime >= '2024-01-01T00:00:00' AND request_datetime < '2024-01-08T00:00:00'"
 page_size <- 50000L
-max_pages <- 5L
-pages <- list()
+# Safety ceiling: 100 pages (up to 5 million records). If reached, the
+# extraction is flagged as potentially incomplete rather than silently accepted.
+max_pages <- 100L
+pages <- vector("list", max_pages)
+last_page_rows <- 0L
 
 for (i in seq_len(max_pages)) {
   offset <- (i - 1L) * page_size
@@ -111,7 +114,7 @@ for (i in seq_len(max_pages)) {
     httr2::req_url_query(
       `$select` = paste(selected_fields, collapse = ","),
       `$where` = where_clause,
-      `$order` = "request_datetime",
+      `$order` = "request_datetime, :id",
       `$limit` = page_size,
       `$offset` = offset
     ) |>
@@ -119,18 +122,26 @@ for (i in seq_len(max_pages)) {
   resp <- httr2::req_perform(req)
   httr2::resp_check_status(resp)
   page <- jsonlite::fromJSON(httr2::resp_body_string(resp), flatten = TRUE)
-  if (nrow(page) == 0) break
-  pages[[length(pages) + 1L]] <- page
-  if (nrow(page) < page_size) break
+  last_page_rows <- nrow(page)
+  if (last_page_rows == 0L) break
+  pages[[i]] <- page
+  if (last_page_rows < page_size) break
 }
+pages <- Filter(Negate(is.null), pages)
 if (!length(pages)) stop("The API returned no records. Check the source endpoint and date filter.")
 raw_trips <- dplyr::bind_rows(pages)
+extraction_complete <- length(pages) < max_pages || last_page_rows < page_size
+if (!extraction_complete) {
+  warning("The 5-million-record safety ceiling was reached. Treat this extraction as potentially incomplete; narrow the date window or raise max_pages.")
+}
 extraction_time <- Sys.time()
 query_log <- paste0("Dataset=", dataset_id, "; date filter=", where_clause,
-                    "; page size=", page_size, "; max pages=", max_pages)
+                    "; page size=", page_size, "; pages retrieved=", length(pages),
+                    "; safety ceiling=", max_pages, "; extraction complete=", extraction_complete)
 cat("Extraction timestamp:", format(extraction_time, tz = "UTC"), "UTC\n")
 cat("Query:", query_log, "\n")
 cat("Rows retrieved:", nrow(raw_trips), "\n")
+cat("Extraction complete:", extraction_complete, "\n")
 ```
 
 # 5. Data understanding and preparation
