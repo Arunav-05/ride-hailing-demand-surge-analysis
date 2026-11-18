@@ -287,10 +287,31 @@ panel <- tidyr::expand_grid(pickup_zone = zone_ids, hour = hour_seq) |>
   dplyr::ungroup() |>
   dplyr::filter(!is.na(lag_1), !is.na(lag_24), !is.na(rolling_24)) |>
   dplyr::arrange(hour)
-if (nrow(panel) < 100) stop("Not enough zone-hour observations after feature engineering; expand the extraction window.")
-knitr::kable(dplyr::summarise(panel, zones = dplyr::n_distinct(pickup_zone),
-                              hours = dplyr::n_distinct(hour), rows = dplyr::n()),
-             caption = "Model panel dimensions")
+panel_dimensions <- dplyr::summarise(
+  panel,
+  zones = dplyr::n_distinct(pickup_zone),
+  hours = dplyr::n_distinct(hour),
+  rows = dplyr::n()
+)
+knitr::kable(panel_dimensions, caption = "Model panel dimensions")
+
+# A short or sparse extract should be diagnosed explicitly. The former fixed
+# 100-row cutoff could reject a valid small panel without showing why.
+if (panel_dimensions$zones < 2 || panel_dimensions$hours < 48 || nrow(panel) < 20) {
+  stop(
+    "Insufficient data for a reliable zone-hour model. ",
+    "Observed ", panel_dimensions$zones, " zones, ",
+    panel_dimensions$hours, " distinct hours and ",
+    nrow(panel), " usable rows after lag creation. ",
+    "Check the extraction row count and date filter in Section 4."
+  )
+}
+if (nrow(panel) < 100) {
+  warning(
+    "The model panel contains fewer than 100 usable zone-hour rows (",
+    nrow(panel), "). Results may be unstable; consider extending the date window."
+  )
+}
 ```
 
 ## 7.2 Chronological train/test split
