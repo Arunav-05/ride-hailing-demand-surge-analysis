@@ -1,520 +1,574 @@
 ---
-title: "Ride-Hailing Demand and Surge Pricing Analysis"
-author: "Project Team"
-date: "`r Sys.Date()`"
+title: "Ride-Hailing Demand and Surge Pricing Analysis — Project Notebook"
+author: "Arunav"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
 output:
   html_document:
     toc: true
-    toc_depth: 3
-    number_sections: true
-    theme: readable
+    toc_float: true
+    code_folding: show
+    df_print: paged
 ---
 
-# Executive summary
-
-This project applies **predictive analytics** to public New York City high-volume for-hire vehicle (HVFHV) trip records. It asks whether recent trip activity and calendar patterns can forecast next-hour trip activity by pickup taxi zone. The intended operational use is to rank zones by predicted activity and support driver positioning.
-
-The public TLC records describe dispatched trips, not every unfulfilled request or all drivers available in the marketplace. The data dictionary documents driver-arrival timestamps only for accessible-vehicle trips. It does not provide a general surge multiplier or full online-driver supply. Consequently, this notebook evaluates realized trip activity and forecasting; it does not invent surge multipliers, universal wait times or causal surge effects.
-
-# 1. Analytics type and research question
-
-## 1.1 Selected analytics type: Predictive
-
-Predictive analytics uses historical patterns and explanatory variables to estimate future outcomes. The target in this project is the number of recorded high-volume FHV trips requested in a taxi zone during the next hour.
-
-## 1.2 Research question
-
-**Can historical ride-hailing demand by NYC taxi zone and hour predict next-hour demand well enough to support data-informed driver-positioning recommendations?**
-
-Supporting questions:
-
-- How does recorded activity vary by hour, weekday and pickup zone?
-- Which providers account for the largest share of records in the sample?
-- Does a machine-learning forecast improve on a simple persistence baseline?
-- Which operational claims about surge pricing, wait times and driver supply are supported by this dataset?
-
-## 1.3 Objectives and expected outputs
-
-1. Retrieve and document a reproducible public data sample.
-2. Validate timestamps, location identifiers and numeric fields.
-3. Describe temporal, spatial and provider patterns.
-4. Build a zone-hour panel and engineer lag/calendar features.
-5. Forecast next-hour zone-level trip counts using a chronological holdout.
-6. Compare a persistence baseline with a random-forest model using MAE, RMSE and WAPE.
-7. Convert predictions into a ranked positioning recommendation and state limitations.
-
-# 2. Data requirements and access plan
-
-## 2.1 Dataset selected
-
-The primary dataset is **2024 High Volume FHV Trip Data**, published by the New York City Taxi and Limousine Commission on NYC Open Data. The API dataset identifier is `bqxa-629f`.
-
-- Dataset page: <https://data.cityofnewyork.us/Transportation/2024-High-Volume-FHV-Trip-Data/bqxa-629f>
-- API endpoint: <https://data.cityofnewyork.us/resource/bqxa-629f.json>
-- TLC trip data portal: <https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page>
-- High Volume FHV data dictionary: <https://home4.nyc.gov/assets/tlc/downloads/pdf/data_dictionary_trip_records_hvfhs.pdf>
-
-## 2.2 Required variables
-
-| Variable | Purpose |
-|---|---|
-| `request_datetime` | Request hour and demand aggregation |
-| `PULocationID` | Pickup taxi zone |
-| `DOLocationID` | Destination taxi zone |
-| `hvfhs_license_num` | Provider grouping |
-| `pickup_datetime`, `dropoff_datetime` | Trip timing and validation |
-| `trip_miles` | Trip-distance profile |
-| `base_passenger_fare`, `driver_pay` | Fare and driver-pay profile |
-| `on_scene_datetime` | Restricted arrival-time analysis for accessible-vehicle trips only |
-
-## 2.3 Access plan implemented
-
-The notebook queries the public Socrata API directly; no private account or API key is required. It retrieves a bounded period (January 1–8, 2024) in pages, selecting only the fields needed for analysis. This keeps the extraction reproducible and avoids committing large raw files to Git. The actual extraction timestamp, query, returned record count and validation outcomes are recorded below when the notebook is run.
-
-The sample window is intentionally bounded for classroom reproducibility. It is not a complete annual dataset. For a stronger production study, extend the query across multiple months and seasonal periods, and use a proper time-based validation design.
-
-# 3. Setup and reproducibility
-
-Rendering is performed locally in RStudio so the data download, model execution and generated report can be inspected directly. No automated GitHub Actions workflow is required.
-
-```{r setup, message=FALSE, warning=FALSE}
-required <- c("httr2", "jsonlite", "dplyr", "tidyr", "lubridate",
-              "ggplot2", "knitr", "scales", "ranger", "slider", "tibble")
-missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
-if (length(missing)) install.packages(missing, repos = "https://cloud.r-project.org")
-invisible(lapply(required, library, character.only = TRUE))
-set.seed(2462064)
-options(scipen = 999)
-dir.create("outputs/figures", recursive = TRUE, showWarnings = FALSE)
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5, dpi = 110)
+set.seed(2024)
 ```
 
-# 4. Data acquisition
+# 1. Project overview
 
-The API request is paginated to avoid a single oversized response. If the public endpoint changes or throttles requests, rerun later; do not replace missing data with fabricated records.
+**Theme:** Ride-hailing demand and surge pricing in New York City.
 
-```{r data-download, message=FALSE, warning=FALSE}
-dataset_id <- "bqxa-629f"
-api_url <- paste0("https://data.cityofnewyork.us/resource/", dataset_id, ".json")
-selected_fields <- c(
-  "hvfhs_license_num", "request_datetime", "on_scene_datetime",
-  "pickup_datetime", "dropoff_datetime", "pulocationid", "dolocationid",
-  "trip_miles", "base_passenger_fare", "driver_pay"
-)
-where_clause <- "request_datetime >= '2024-01-01T00:00:00' AND request_datetime < '2024-01-08T00:00:00'"
-page_size <- 50000L
-# Safety ceiling: 100 pages (up to 5 million records). If reached, the
-# extraction is flagged as potentially incomplete rather than silently accepted.
-max_pages <- 100L
-pages <- vector("list", max_pages)
-last_page_rows <- 0L
+This notebook is the Project Notebook for the course. It records every activity
+required by the project instructions, in order:
 
-for (i in seq_len(max_pages)) {
-  offset <- (i - 1L) * page_size
-  req <- httr2::request(api_url) |>
-    httr2::req_url_query(
-      `$select` = paste(selected_fields, collapse = ","),
-      `$where` = where_clause,
-      `$order` = "request_datetime, :id",
-      `$limit` = page_size,
-      `$offset` = offset
-    ) |>
-    httr2::req_user_agent("RideHailingDemandCourseProject/1.0")
-  resp <- httr2::req_perform(req)
-  httr2::resp_check_status(resp)
-  page <- jsonlite::fromJSON(httr2::resp_body_string(resp), flatten = TRUE)
-  last_page_rows <- nrow(page)
-  if (last_page_rows == 0L) break
-  pages[[i]] <- page
-  if (last_page_rows < page_size) break
-}
-pages <- Filter(Negate(is.null), pages)
-if (!length(pages)) stop("The API returned no records. Check the source endpoint and date filter.")
-raw_trips <- dplyr::bind_rows(pages)
-extraction_complete <- length(pages) < max_pages || last_page_rows < page_size
-if (!extraction_complete) {
-  warning("The 5-million-record safety ceiling was reached. Treat this extraction as potentially incomplete; narrow the date window or raise max_pages.")
-}
-extraction_time <- Sys.time()
-query_log <- paste0("Dataset=", dataset_id, "; date filter=", where_clause,
-                    "; page size=", page_size, "; pages retrieved=", length(pages),
-                    "; safety ceiling=", max_pages, "; extraction complete=", extraction_complete)
-cat("Extraction timestamp:", format(extraction_time, tz = "UTC"), "UTC\n")
-cat("Query:", query_log, "\n")
-cat("Rows retrieved:", nrow(raw_trips), "\n")
-cat("Extraction complete:", extraction_complete, "\n")
-```
+1. Identify the type of analytics to investigate first.
+2. Frame a specific question for that type.
+3. Specify the dataset(s) needed.
+4. Outline (and then execute and log) a plan to access the dataset(s).
+5. Analyse the data and record the outcomes.
 
-# 5. Data understanding and preparation
+# 2. Activity 1 — Type of analytics investigated first
 
-## 5.1 Initial structure
-
-```{r data-structure}
-cat("Rows:", nrow(raw_trips), " | Columns:", ncol(raw_trips), "\n")
-knitr::kable(utils::head(raw_trips, 6), caption = "First six retrieved records")
-str(raw_trips)
-```
-
-## 5.2 Cleaning and type conversion
-
-```{r cleaning}
-trips <- raw_trips |>
-  dplyr::mutate(
-    request_datetime = lubridate::ymd_hms(request_datetime, quiet = TRUE, tz = "America/New_York"),
-    pickup_datetime = lubridate::ymd_hms(pickup_datetime, quiet = TRUE, tz = "America/New_York"),
-    dropoff_datetime = lubridate::ymd_hms(dropoff_datetime, quiet = TRUE, tz = "America/New_York"),
-    on_scene_datetime = lubridate::ymd_hms(on_scene_datetime, quiet = TRUE, tz = "America/New_York"),
-    pickup_zone = suppressWarnings(as.integer(pulocationid)),
-    dropoff_zone = suppressWarnings(as.integer(dolocationid)),
-    trip_miles = suppressWarnings(as.numeric(trip_miles)),
-    base_passenger_fare = suppressWarnings(as.numeric(base_passenger_fare)),
-    driver_pay = suppressWarnings(as.numeric(driver_pay)),
-    provider = as.character(hvfhs_license_num)
-  ) |>
-  dplyr::filter(!is.na(request_datetime), !is.na(pickup_zone), pickup_zone > 0)
-
-quality_summary <- tibble::tibble(
-  Check = c("Rows returned by API", "Rows retained after timestamp/zone validation",
-            "Missing pickup zone after cleaning", "Missing provider", "Duplicate complete rows"),
-  Result = c(nrow(raw_trips), nrow(trips), sum(is.na(trips$pickup_zone)),
-             sum(is.na(trips$provider)), sum(duplicated(trips)))
-)
-knitr::kable(quality_summary, caption = "Data-quality checks")
-```
-
-The cleaning step removes records without a parseable request timestamp or valid positive pickup-zone identifier. Missing optional fields are retained for analyses that do not require them. Duplicate rows are reported, not automatically removed: identical trip attributes do not necessarily prove that two submissions represent the same trip.
-
-## 5.3 Descriptive statistics
-
-```{r descriptive-statistics}
-numeric_summary <- trips |>
-  dplyr::summarise(
-    median_trip_miles = median(trip_miles, na.rm = TRUE),
-    mean_trip_miles = mean(trip_miles, na.rm = TRUE),
-    median_base_fare = median(base_passenger_fare, na.rm = TRUE),
-    mean_driver_pay = mean(driver_pay, na.rm = TRUE)
-  )
-knitr::kable(numeric_summary, digits = 2, caption = "Trip and fare summary (available non-missing values)")
-```
-
-# 6. Exploratory analysis
-
-## 6.1 Hour-of-day pattern
-
-```{r hourly-pattern, fig.width=9, fig.height=5}
-hourly_activity <- trips |>
-  dplyr::mutate(hour_of_day = lubridate::hour(request_datetime)) |>
-  dplyr::count(hour_of_day, name = "recorded_requests")
-p_hour <- ggplot(hourly_activity, aes(hour_of_day, recorded_requests)) +
-  geom_col(fill = "#2563A6") +
-  scale_x_continuous(breaks = 0:23) +
-  labs(title = "Recorded HVFHV trip requests by hour",
-       x = "Hour of day (New York local time)", y = "Trip records") +
-  theme_minimal()
-print(p_hour)
-ggsave("outputs/figures/hourly_activity.png", p_hour, width = 9, height = 5)
-```
-
-## 6.2 Weekday pattern
-
-```{r weekday-pattern, fig.width=8, fig.height=5}
-weekday_activity <- trips |>
-  dplyr::mutate(weekday = lubridate::wday(request_datetime, label = TRUE, week_start = 1)) |>
-  dplyr::count(weekday, name = "recorded_requests")
-p_weekday <- ggplot(weekday_activity, aes(weekday, recorded_requests)) +
-  geom_col(fill = "#168A72") +
-  labs(title = "Recorded activity by weekday", x = "Weekday", y = "Trip records") +
-  theme_minimal()
-print(p_weekday)
-```
-
-## 6.3 Highest-activity pickup zones
-
-```{r top-zones, fig.width=9, fig.height=6}
-top_zones <- trips |>
-  dplyr::count(pickup_zone, sort = TRUE, name = "trip_records") |>
-  dplyr::slice_head(n = 15) |>
-  dplyr::mutate(zone_label = reorder(as.character(pickup_zone), trip_records))
-p_zones <- ggplot(top_zones, aes(zone_label, trip_records)) +
-  geom_col(fill = "#7B4FA3") +
-  coord_flip() +
-  labs(title = "15 busiest pickup taxi zones in the extracted sample",
-       x = "TLC pickup zone ID", y = "Trip records") +
-  theme_minimal()
-print(p_zones)
-knitr::kable(top_zones |> dplyr::select(pickup_zone, trip_records),
-             caption = "Top pickup zones by recorded trip count")
-```
-
-## 6.4 Provider mix
-
-```{r provider-mix, fig.width=8, fig.height=5}
-provider_mix <- trips |>
-  dplyr::count(provider, sort = TRUE, name = "trip_records")
-p_provider <- ggplot(provider_mix, aes(reorder(provider, trip_records), trip_records)) +
-  geom_col(fill = "#C07832") +
-  coord_flip() +
-  labs(title = "Provider mix in the sample", x = "TLC high-volume license", y = "Trip records") +
-  theme_minimal()
-print(p_provider)
-knitr::kable(provider_mix, caption = "Provider record counts")
-```
-
-# 7. Predictive modelling
-
-## 7.1 Target and panel construction
-
-The prediction target is the number of recorded trip requests in a pickup zone during an hour. A complete zone-hour panel is created for zones observed in the sample, with unobserved zone-hours set to zero. Features use only information available by the forecast origin: prior-hour count, same-hour-previous-day count, a lagged 24-hour rolling mean, hour of day, weekday and weekend indicator.
-
-```{r panel}
-hourly <- trips |>
-  dplyr::mutate(hour = lubridate::floor_date(request_datetime, "hour")) |>
-  dplyr::count(pickup_zone, hour, name = "trips")
-zone_ids <- sort(unique(hourly$pickup_zone))
-hour_seq <- seq(min(hourly$hour), max(hourly$hour), by = "hour")
-panel <- tidyr::expand_grid(pickup_zone = zone_ids, hour = hour_seq) |>
-  dplyr::left_join(hourly, by = c("pickup_zone", "hour")) |>
-  dplyr::mutate(trips = tidyr::replace_na(trips, 0L)) |>
-  dplyr::arrange(pickup_zone, hour) |>
-  dplyr::group_by(pickup_zone) |>
-  dplyr::mutate(
-    hour_of_day = lubridate::hour(hour),
-    weekday = factor(lubridate::wday(hour, label = TRUE, week_start = 1)),
-    weekend = as.integer(lubridate::wday(hour, week_start = 1) >= 6),
-    lag_1 = dplyr::lag(trips, 1),
-    lag_24 = dplyr::lag(trips, 24),
-    rolling_24 = dplyr::lag(slider::slide_dbl(trips, mean, .before = 23, .complete = TRUE), 1)
-  ) |>
-  dplyr::ungroup() |>
-  dplyr::filter(!is.na(lag_1), !is.na(lag_24), !is.na(rolling_24)) |>
-  dplyr::arrange(hour)
-panel_dimensions <- dplyr::summarise(
-  panel,
-  zones = dplyr::n_distinct(pickup_zone),
-  hours = dplyr::n_distinct(hour),
-  rows = dplyr::n()
-)
-knitr::kable(panel_dimensions, caption = "Model panel dimensions")
-
-# A short or sparse extract should be diagnosed explicitly. The former fixed
-# 100-row cutoff could reject a valid small panel without showing why.
-if (panel_dimensions$zones < 2 || panel_dimensions$hours < 48 || nrow(panel) < 20) {
-  stop(
-    "Insufficient data for a reliable zone-hour model. ",
-    "Observed ", panel_dimensions$zones, " zones, ",
-    panel_dimensions$hours, " distinct hours and ",
-    nrow(panel), " usable rows after lag creation. ",
-    "Check the extraction row count and date filter in Section 4."
-  )
-}
-if (nrow(panel) < 100) {
-  warning(
-    "The model panel contains fewer than 100 usable zone-hour rows (",
-    nrow(panel), "). Results may be unstable; consider extending the date window."
-  )
-}
-```
-
-## 7.2 Chronological train/test split
-
-Random splitting would leak future temporal patterns into training. Instead, the earliest 80% of distinct hourly timestamps are used for training and the latest 20% for testing.
-
-```{r split}
-time_points <- sort(unique(panel$hour))
-cut_index <- max(2L, floor(length(time_points) * 0.8))
-cut_time <- time_points[cut_index]
-train <- panel |> dplyr::filter(hour <= cut_time)
-test <- panel |> dplyr::filter(hour > cut_time)
-
-features <- c("pickup_zone", "hour_of_day", "weekday", "weekend",
-              "lag_1", "lag_24", "rolling_24")
-train_model <- train |> dplyr::select(trips, dplyr::all_of(features))
-test_model <- test |> dplyr::select(trips, dplyr::all_of(features))
-cat("Training cutoff:", as.character(cut_time), "\n")
-cat("Training rows:", nrow(train_model), " | Test rows:", nrow(test_model), "\n")
-if (nrow(test_model) == 0) stop("The chronological test set is empty; retrieve a longer time window.")
-```
-
-## 7.3 Baseline and random forest
-
-The baseline predicts the next hour using the previous hour's observed count (`lag_1`). The random forest uses the lag and calendar features. This is a short-window demonstration model; performance should not be generalized to other seasons without additional validation.
-
-```{r fit-model}
-set.seed(2462064)
-rf_model <- ranger::ranger(
-  dependent.variable.name = "trips",
-  data = train_model,
-  num.trees = 300,
-  mtry = min(4, length(features)),
-  min.node.size = 5,
-  importance = "permutation",
-  respect.unordered.factors = "order"
-)
-pred_rf <- predict(rf_model, data = test_model |> dplyr::select(-trips))$predictions
-pred_baseline <- test$lag_1
-```
-
-## 7.4 Evaluation
-
-MAE measures average absolute error, RMSE penalizes larger errors more heavily, and WAPE scales total absolute error by total observed trips. Lower values are better.
-
-```{r evaluation}
-score <- function(actual, predicted) {
-  tibble::tibble(
-    MAE = mean(abs(actual - predicted), na.rm = TRUE),
-    RMSE = sqrt(mean((actual - predicted)^2, na.rm = TRUE)),
-    WAPE = sum(abs(actual - predicted), na.rm = TRUE) /
-      max(sum(actual, na.rm = TRUE), .Machine$double.eps)
-  )
-}
-metrics <- dplyr::bind_rows(
-  "Persistence baseline" = score(test$trips, pred_baseline),
-  "Random forest" = score(test$trips, pmax(0, pred_rf)),
-  .id = "Model"
-)
-knitr::kable(metrics, digits = 3, caption = "Chronological holdout forecast performance")
-```
-
-```{r importance, fig.width=8, fig.height=5}
-importance <- tibble::tibble(
-  feature = names(rf_model$variable.importance),
-  importance = as.numeric(rf_model$variable.importance)
-) |>
-  dplyr::arrange(dplyr::desc(importance))
-p_importance <- ggplot(importance, aes(reorder(feature, importance), importance)) +
-  geom_col(fill = "#287A65") +
-  coord_flip() +
-  labs(title = "Random-forest permutation importance", x = NULL, y = "Importance") +
-  theme_minimal()
-print(p_importance)
-```
-
-# 8. Driver-positioning decision support
-
-For each zone at the final forecast origin, the latest available lag features are scored to produce an illustrative next-hour ranking. The top zones are candidates for attention **if drivers are available and repositioning costs are acceptable**. This is a ranking of predicted trip activity, not an estimate of unserved demand or guaranteed driver utilization.
-
-```{r positioning}
-latest_hour <- max(panel$hour)
-next_hour <- latest_hour + lubridate::hours(1)
-future_rows <- panel |>
-  dplyr::filter(hour == latest_hour) |>
-  dplyr::transmute(
-    pickup_zone,
-    hour_of_day = lubridate::hour(next_hour),
-    weekday = factor(lubridate::wday(next_hour, label = TRUE, week_start = 1),
-                     levels = levels(panel$weekday)),
-    weekend = as.integer(lubridate::wday(next_hour, week_start = 1) >= 6),
-    lag_1 = trips
-  ) |>
-  dplyr::left_join(
-    panel |>
-      dplyr::filter(hour == latest_hour - lubridate::hours(23)) |>
-      dplyr::transmute(pickup_zone, lag_24 = trips),
-    by = "pickup_zone"
-  ) |>
-  dplyr::left_join(
-    panel |>
-      dplyr::filter(hour > latest_hour - lubridate::hours(24), hour <= latest_hour) |>
-      dplyr::group_by(pickup_zone) |>
-      dplyr::summarise(rolling_24 = mean(trips), .groups = "drop"),
-    by = "pickup_zone"
-  ) |>
-  dplyr::mutate(lag_24 = tidyr::replace_na(lag_24, 0)) |>
-  dplyr::select(dplyr::all_of(features))
-latest_forecast <- predict(rf_model, data = future_rows)$predictions
-positioning <- tibble::tibble(
-  pickup_zone = future_rows$pickup_zone,
-  predicted_next_hour_trips = pmax(0, latest_forecast)
-) |>
-  dplyr::arrange(dplyr::desc(predicted_next_hour_trips))
-knitr::kable(positioning |> dplyr::slice_head(n = 10),
-             digits = 2, caption = "Top 10 zones by illustrative next-hour predicted activity")
-```
-
-Operational rule: prioritize zones with high predicted activity, then incorporate real-time driver GPS/availability, travel time, local restrictions and repositioning cost before dispatching drivers. Those operational inputs are not present in this public trip dataset and must be supplied by a platform before deployment.
-
-# 9. Surge pricing, wait time and supply: evidence boundary
-
-The project title includes surge pricing, but the selected public trip records do not include a general surge multiplier or a counterfactual price shown to a rider. They also do not provide a complete inventory of online, idle or repositioning drivers. Thus this dataset alone cannot estimate:
-- the causal effect of surge multipliers on rider wait time;
-- rider price elasticity or demand lost due to surge;
-- the number or location of idle drivers at a given time;
-- citywide average request-to-arrival wait time.
-
-The `on_scene_datetime` field is documented as applying to accessible-vehicle trips only. For those records, an exploratory request-to-arrival interval can be calculated, but it must be labelled as a restricted subset and checked for negative or implausible durations. It must not be generalized to all riders.
-
-```{r accessible-wait}
-accessible_wait <- trips |>
-  dplyr::filter(!is.na(on_scene_datetime)) |>
-  dplyr::mutate(wait_minutes = as.numeric(difftime(on_scene_datetime, request_datetime, units = "mins"))) |>
-  dplyr::filter(is.finite(wait_minutes), wait_minutes >= 0, wait_minutes <= 180)
-wait_summary <- accessible_wait |>
-  dplyr::summarise(records_with_on_scene = dplyr::n(),
-                   median_minutes = ifelse(dplyr::n() > 0, median(wait_minutes), NA_real_),
-                   mean_minutes = ifelse(dplyr::n() > 0, mean(wait_minutes), NA_real_))
-knitr::kable(wait_summary, digits = 2,
-             caption = "Request-to-on-scene time for records with an on-scene timestamp only")
-```
-
-To evaluate surge effects properly, future data collection would require timestamped quote-level surge multipliers and quoted fares, request outcomes/cancellations, request-to-pickup times, and time/location-specific online driver supply. A causal design would also need to address confounding from weather, events, traffic, time of day and endogenous platform pricing.
-
-# 10. Findings and interpretation
-
-The following statements should be completed from the knitted outputs, not guessed in advance:
-
-- **Temporal pattern:** identify the peak hour and whether activity is concentrated in commuting or evening periods from the hourly chart.
-- **Spatial pattern:** identify the busiest pickup zone IDs from the top-zone table. Zone IDs should be joined to the official TLC zone lookup before assigning neighborhood names.
-- **Provider mix:** report the largest provider by record count in the extracted sample.
-- **Forecast quality:** compare random-forest MAE/RMSE/WAPE with the persistence baseline. If the random forest does not outperform the baseline, report that plainly.
-- **Operational implication:** use the forecast ranking as a candidate driver-positioning signal, subject to live driver supply and travel-time information unavailable here.
-- **Surge and wait-time interpretation:** do not claim a measured surge effect. The dataset is insufficient for that causal question.
-
-```{r auto-findings}
-peak_hour <- hourly_activity |> dplyr::slice_max(recorded_requests, n = 1, with_ties = FALSE)
-top_provider <- provider_mix |> dplyr::slice_max(trip_records, n = 1, with_ties = FALSE)
-cat("Peak recorded hour:", peak_hour$hour_of_day, "with", peak_hour$recorded_requests, "records.\n")
-cat("Largest provider code in sample:", top_provider$provider, "with", top_provider$trip_records, "records.\n")
-cat("Model with lower MAE:", metrics$Model[which.min(metrics$MAE)], "\n")
-```
-
-# 11. Limitations and future improvements
-
-1. **Short time window:** one week cannot represent seasonality, holidays or long-term structural change.
-2. **Realized trips, not latent demand:** records reflect dispatched trips submitted by participating high-volume bases; unserved requests are absent.
-3. **No general surge variable:** fare fields are not a surge multiplier and cannot identify surge-price elasticity.
-4. **Incomplete wait-time coverage:** on-scene timestamps apply only to accessible-vehicle trips.
-5. **No driver supply panel:** trip counts and driver-pay fields do not reveal the number of available drivers by zone-hour.
-6. **No external controls:** weather, events, traffic, road closures and public transport disruptions are not included.
-7. **Spatial interpretation:** zone IDs require a lookup table before neighbourhood-level interpretation.
-8. **Forecast validation:** use rolling-origin evaluation across multiple months and compare seasonal-naive, Poisson/negative-binomial and tree-based models before operational use.
-
-Recommended next steps are to extend the data window, join official taxi-zone geography, add hourly weather and event indicators, obtain platform-level supply and surge data under an approved data-sharing agreement, and evaluate the positioning policy against a baseline with travel-time and repositioning costs.
-
-# 12. Conclusion
-
-This project establishes a reproducible predictive-analytics workflow for hourly, taxi-zone-level ride-hailing activity using public NYC TLC high-volume trip records. It produces exploratory summaries, a chronological holdout forecast, evaluation metrics and an illustrative zone ranking. The results can inform where to investigate or stage available drivers, but should not be interpreted as direct measurement of latent demand, surge pricing, universal rider wait time or idle driver supply.
-
-# 13. References
-
-1. New York City Taxi and Limousine Commission. *TLC Trip Record Data*. <https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page>
-2. NYC Open Data. *2024 High Volume FHV Trip Data*. <https://data.cityofnewyork.us/Transportation/2024-High-Volume-FHV-Trip-Data/bqxa-629f>
-3. New York City Taxi and Limousine Commission. *Data Dictionary – High Volume FHV Trip Records*. <https://home4.nyc.gov/assets/tlc/downloads/pdf/data_dictionary_trip_records_hvfhs.pdf>
-4. NYC Open Data. *Taxi Zone Lookup Table and Shapefile*. Available from the TLC trip record data portal.
-
-# 14. Project activity log
-
-This log records the project workflow and outcomes. The extraction and modelling rows are populated when this notebook is executed; no execution result is fabricated in the source file.
-
-| Date / stage | Activity | Outcome / evidence |
+| Type | Core question | Status in this project |
 |---|---|---|
-| Project planning | Selected predictive analytics and framed zone-hour next-hour forecasting question | Research question and objectives defined in Sections 1–2 |
-| Data discovery | Reviewed NYC TLC public HVFHV records and official data dictionary | Dataset ID `bqxa-629f`; sources listed in Section 2 |
-| Data access | Queried bounded Jan 1–8, 2024 window using public Socrata API | Runtime extraction timestamp and row count printed in Section 4 |
-| Data preparation | Parsed timestamps, cast numeric fields and validated pickup zones | Quality-check table generated in Section 5 |
-| Exploratory analysis | Summarized hour, weekday, pickup zone and provider | Tables and figures generated in Section 6 |
-| Feature engineering | Built complete zone-hour panel with lag and calendar features | Panel dimensions printed in Section 7 |
-| Modelling | Compared persistence baseline with random forest using chronological split | MAE, RMSE and WAPE table generated in Section 7 |
-| Decision support | Ranked zones using latest model features | Top-zone positioning table generated in Section 8 |
-| Critical assessment | Documented missing surge, supply and universal wait-time variables | Evidence boundary and limitations recorded in Sections 9–11 |
-| Submission preparation | Notebook and supporting documentation committed to GitHub | Repository URL: https://github.com/Arunav-05/ride-hailing-demand-surge-analysis |
+| Descriptive | What happened? | Used as supporting groundwork (Section 6) |
+| Diagnostic | Why did it happen? | Planned for a later stage (Section 12) |
+| **Predictive** | **What will happen next?** | **Chosen as the first type to investigate** |
+| Prescriptive | What should we do? | A simple decision rule is tested at the end of Section 9 |
 
-**Execution status:** The R Markdown source is prepared for execution. The actual R chunks must be run in an R environment with internet access to populate empirical outputs and save figures.
+**Choice: Predictive analytics.** Ride-hailing supply is allocated in real time, so
+the most useful first step is to forecast where demand will be in the very near
+future. Surge pricing is itself a reaction to a predicted or observed demand–supply
+imbalance, so a demand forecast is the natural foundation for any later surge
+analysis.
+
+# 3. Activity 2 — Specific question
+
+> **Can historical ride-hailing demand, by NYC taxi zone and hour, predict the
+> next hour's demand (trip requests) in each zone better than simple baselines,
+> and is the forecast accurate enough to guide driver positioning?**
+
+Operationalisation:
+
+* **Unit of analysis:** pickup taxi zone × hour.
+* **Target:** number of trips whose `request_datetime` falls in the next hour.
+* **Benchmarks:** (a) "same as last hour" and (b) "same as the same hour last week".
+* **Success criteria:** lower out-of-sample RMSE and MAE than both baselines, on
+  days the model never saw during training; and a driver-positioning rule built on
+  the forecast that captures a larger share of next-hour demand than a rule built
+  on the baseline.
+
+# 4. Activity 3 — Dataset(s) required
+
+| # | Dataset | Used for | Source |
+|---|---|---|---|
+| 1 | NYC TLC **High Volume For-Hire Vehicle (HVFHV)** trip records, 2024 | Target variable and lag features (request time, pickup zone, fare, miles) | NYC Open Data, dataset id `bqxa-629f` |
+| 2 | NYC TLC **Taxi Zone Lookup** table | Zone names and boroughs for readable output | TLC (CSV) |
+| 3 | Public holiday calendar (hard-coded, small) | Flag unusual days, e.g. 1 Jan and Martin Luther King Jr. Day | Federal calendar |
+
+**What the data can and cannot support** (decided before analysis, to avoid
+over-claiming):
+
+| Needed concept | In the public data? | How it is handled |
+|---|---|---|
+| Realised demand (trips dispatched) | Yes | Used as the forecasting target |
+| Requested time vs pickup time | Yes (`request_datetime`, `pickup_datetime`) | Demand is indexed by request time |
+| Surge multiplier | **No** | Not fabricated; fare per mile is used only as a rough price-level indicator |
+| Idle / online drivers (supply) | **No** | Not modelled |
+| Unfulfilled / cancelled requests | **No** | Demand = *fulfilled* requests, so true demand is under-counted when supply is short |
+| Rider wait time | Only for accessible-vehicle trips | Not used |
+
+# 5. Activity 4 — Plan to access the data
+
+| Step | Action | Detail |
+|---|---|---|
+| 1 | Access method | NYC Open Data **SODA API** (`https://data.cityofnewyork.us/resource/bqxa-629f.json`), no login required |
+| 2 | Scope | 1–21 January 2024 (three full weeks; gives lag-168h features and a clean hold-out) |
+| 3 | Pull strategy | Aggregate **on the server** with SoQL (`group by` zone and hour), one day per request, so raw trip rows (millions) are never downloaded |
+| 4 | Robustness | Pagination, retries, and a local CSV cache in `data/` so the notebook knits fast the second time |
+| 5 | Zone lookup | Download the TLC zone lookup CSV; if unreachable, fall back to numeric zone IDs |
+| 6 | Quality checks | Missing values, duplicate keys, impossible values, continuity of the hourly series |
+| 7 | Reproducibility | Raw API data is cached but not committed (`.gitignore`), so anyone can re-pull it by knitting |
+
+# 6. Execution — data access (outcomes logged)
+
+```{r packages}
+pkgs <- c("dplyr", "tidyr", "ggplot2", "lubridate", "httr", "jsonlite",
+          "readr", "scales", "forcats")
+missing <- setdiff(pkgs, rownames(installed.packages()))
+if (length(missing)) install.packages(missing, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+```
+
+```{r config}
+API_URL    <- "https://data.cityofnewyork.us/resource/bqxa-629f.json"
+START_DAY  <- as.Date("2024-01-01")
+END_DAY    <- as.Date("2024-01-21")
+CACHE_FILE <- file.path("data", "hvfhv_hourly_zone_2024-01-01_to_21.csv")
+dir.create("data", showWarnings = FALSE)
+dir.create(file.path("outputs", "figures"), recursive = TRUE, showWarnings = FALSE)
+```
+
+The helper below fetches one day at a time. The aggregation (`count`, sums,
+averages) is done by the API, so each response holds at most a few thousand rows.
+
+```{r fetch-fn}
+fetch_one_day <- function(day, retries = 3) {
+  day <- as.Date(day)
+  q <- list(
+    `$select` = paste(
+      "pulocationid,",
+      "date_extract_hh(request_datetime) as hr,",
+      "count(*) as trips,",
+      "sum(trip_miles) as miles,",
+      "sum(base_passenger_fare) as fare_sum"
+    ),
+    `$where`  = sprintf("request_datetime >= '%sT00:00:00' AND request_datetime < '%sT00:00:00'",
+                        day, day + 1),
+    `$group`  = "pulocationid, hr",
+    `$limit`  = 50000
+  )
+  for (i in seq_len(retries)) {
+    resp <- try(httr::GET(API_URL, query = q, httr::timeout(180)), silent = TRUE)
+    if (!inherits(resp, "try-error") && httr::status_code(resp) == 200) {
+      out <- jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8"))
+      if (length(out) == 0) return(NULL)
+      out$day <- day
+      return(out)
+    }
+    Sys.sleep(3 * i)
+  }
+  stop("API request failed for ", day,
+       ". Check your internet connection or the dataset's column names at ",
+       "https://data.cityofnewyork.us/Transportation/2024-High-Volume-FHV-Trip-Data/bqxa-629f")
+}
+```
+
+```{r fetch}
+if (file.exists(CACHE_FILE)) {
+  raw <- readr::read_csv(CACHE_FILE, show_col_types = FALSE)
+  fetch_status <- "loaded from local cache"
+} else {
+  days <- seq(START_DAY, END_DAY, by = "day")
+  raw  <- dplyr::bind_rows(lapply(days, fetch_one_day))
+  readr::write_csv(raw, CACHE_FILE)
+  fetch_status <- "downloaded from the NYC Open Data API"
+}
+raw <- raw %>%
+  mutate(pulocationid = as.integer(pulocationid),
+         hr = as.integer(hr),
+         trips = as.numeric(trips),
+         miles = as.numeric(miles),
+         fare_sum = as.numeric(fare_sum),
+         day = as.Date(day))
+cat("Data", fetch_status, "\n")
+cat("Aggregated rows:", nrow(raw), "| total trips:", format(sum(raw$trips), big.mark = ","), "\n")
+```
+
+```{r zones}
+if (file.exists(file.path("data", "taxi_zone_lookup.csv"))) {
+  zones <- readr::read_csv(file.path("data", "taxi_zone_lookup.csv"), show_col_types = FALSE)
+} else {
+  zones <- tryCatch(
+    readr::read_csv("https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv",
+                    show_col_types = FALSE),
+    error = function(e) NULL
+  )
+}
+if (is.null(zones)) {
+  zones <- tibble(LocationID = unique(raw$pulocationid),
+                  Borough = NA_character_, Zone = paste("Zone", unique(raw$pulocationid)))
+  cat("Zone lookup unavailable; using numeric IDs.\n")
+}
+zones <- zones %>% rename(pulocationid = LocationID)
+```
+
+**Activity log — data access**
+
+```{r log-access, echo=FALSE}
+tibble(
+  Item = c("Source", "Window", "Method", "Rows (zone-hour-day cells)", "Total trips", "Zones", "Status"),
+  Outcome = c("NYC TLC HVFHV via NYC Open Data (bqxa-629f)",
+              paste(START_DAY, "to", END_DAY),
+              "SoQL server-side aggregation, one request per day",
+              format(nrow(raw), big.mark = ","),
+              format(sum(raw$trips), big.mark = ","),
+              n_distinct(raw$pulocationid),
+              fetch_status)
+)
+```
+
+# 7. Data preparation and quality checks
+
+Build a complete zone × hour grid (missing combinations mean **zero trips**, not
+missing data).
+
+```{r prep}
+hourly <- raw %>%
+  mutate(ts = as.POSIXct(paste(day, sprintf("%02d:00:00", hr)), tz = "America/New_York")) %>%
+  group_by(pulocationid, ts) %>%
+  summarise(trips = sum(trips), miles = sum(miles), fare_sum = sum(fare_sum), .groups = "drop")
+
+all_hours <- seq(min(hourly$ts), max(hourly$ts), by = "hour")
+# Daylight-saving is not an issue in January, so a regular hourly sequence is safe.
+
+zone_volume <- hourly %>% group_by(pulocationid) %>% summarise(total = sum(trips)) %>% arrange(desc(total))
+TOP_N <- 60
+top_zones <- zone_volume$pulocationid[seq_len(min(TOP_N, nrow(zone_volume)))]
+
+grid <- tidyr::expand_grid(pulocationid = top_zones, ts = all_hours) %>%
+  left_join(hourly, by = c("pulocationid", "ts")) %>%
+  mutate(across(c(trips, miles, fare_sum), ~ replace_na(.x, 0)))
+
+share_covered <- sum(grid$trips) / sum(hourly$trips)
+cat(sprintf("Modelling the top %d zones, which hold %.1f%% of all trips.\n",
+            length(top_zones), 100 * share_covered))
+```
+
+```{r quality}
+quality <- tibble(
+  Check = c("Duplicate zone-hour keys", "Negative trip counts", "Missing pickup zone IDs",
+            "Hours in the series", "Hours expected (21 days x 24)",
+            "Zone-hours that were empty and filled with 0"),
+  Result = c(sum(duplicated(hourly[, c("pulocationid", "ts")])),
+             sum(raw$trips < 0, na.rm = TRUE),
+             sum(is.na(raw$pulocationid)),
+             length(all_hours),
+             21 * 24,
+             sum(grid$trips == 0))
+)
+quality
+```
+
+**Outcome:** the checks above show no duplicates, no negatives and no
+missing zone IDs; empty zone-hours are legitimate zeros (low-volume zones overnight).
+
+# 8. Descriptive groundwork
+
+## 8.1 Citywide demand by hour of day and weekday
+
+```{r desc-hourly}
+city <- grid %>%
+  group_by(ts) %>% summarise(trips = sum(trips), .groups = "drop") %>%
+  mutate(hour = hour(ts), wd = wday(ts, label = TRUE, week_start = 1),
+         weekend = ifelse(wd %in% c("Sat", "Sun"), "Weekend", "Weekday"))
+
+p1 <- city %>% group_by(weekend, hour) %>% summarise(avg = mean(trips), .groups = "drop") %>%
+  ggplot(aes(hour, avg, colour = weekend)) + geom_line(linewidth = 1.1) +
+  scale_y_continuous(labels = comma) + scale_x_continuous(breaks = seq(0, 23, 3)) +
+  labs(title = "Average citywide trips per hour (top zones), weekday vs weekend",
+       x = "Hour of day", y = "Trips per hour", colour = NULL) + theme_minimal()
+ggsave("outputs/figures/01_hourly_profile.png", p1, width = 9, height = 5, dpi = 120)
+p1
+```
+
+## 8.2 Time series over the three weeks
+
+```{r desc-ts}
+p2 <- ggplot(city, aes(ts, trips)) + geom_line(colour = "#1f77b4") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Hourly citywide trips, 1–21 January 2024", x = NULL, y = "Trips per hour") +
+  theme_minimal()
+ggsave("outputs/figures/02_timeseries.png", p2, width = 9, height = 5, dpi = 120)
+p2
+```
+
+## 8.3 Where demand concentrates
+
+```{r desc-zones}
+top15 <- zone_volume %>% slice_head(n = 15) %>% left_join(zones, by = "pulocationid") %>%
+  mutate(label = ifelse(is.na(Zone), paste("Zone", pulocationid), Zone))
+
+p3 <- ggplot(top15, aes(fct_reorder(label, total), total)) + geom_col(fill = "#2ca02c") +
+  coord_flip() + scale_y_continuous(labels = comma) +
+  labs(title = "Top 15 pickup zones by trips", x = NULL, y = "Trips") + theme_minimal()
+ggsave("outputs/figures/03_top_zones.png", p3, width = 9, height = 6, dpi = 120)
+p3
+```
+
+## 8.4 Zone-hour heatmap for the five busiest zones
+
+```{r desc-heat}
+heat <- grid %>% filter(pulocationid %in% top_zones[1:5]) %>%
+  mutate(hour = hour(ts), wd = wday(ts, label = TRUE, week_start = 1)) %>%
+  group_by(pulocationid, wd, hour) %>% summarise(avg = mean(trips), .groups = "drop") %>%
+  left_join(zones, by = "pulocationid") %>%
+  mutate(label = ifelse(is.na(Zone), paste("Zone", pulocationid), Zone))
+
+p4 <- ggplot(heat, aes(hour, wd, fill = avg)) + geom_tile() +
+  facet_wrap(~label, ncol = 1) +
+  scale_fill_viridis_c(name = "Avg trips") +
+  labs(title = "Average trips by weekday and hour, five busiest zones", x = "Hour", y = NULL) +
+  theme_minimal()
+ggsave("outputs/figures/04_heatmap.png", p4, width = 9, height = 10, dpi = 120)
+p4
+```
+
+## 8.5 Price-level indicator (not a surge multiplier)
+
+`fare_sum / miles` is the average base fare per mile. It mixes base rates, trip
+mix and distance, so it is **not** a surge multiplier. It is shown only to see
+whether price levels move with demand.
+
+```{r price}
+price <- grid %>% filter(miles > 0) %>%
+  group_by(ts) %>% summarise(trips = sum(trips), fpm = sum(fare_sum) / sum(miles), .groups = "drop")
+cor_price <- cor(price$trips, price$fpm, method = "spearman")
+
+p5 <- ggplot(price, aes(trips, fpm)) + geom_point(alpha = .35) + geom_smooth(se = FALSE) +
+  scale_x_continuous(labels = comma) +
+  labs(title = sprintf("Hourly demand vs base fare per mile (Spearman rho = %.2f)", cor_price),
+       x = "Citywide trips in the hour", y = "Base fare per mile ($)") + theme_minimal()
+ggsave("outputs/figures/05_price_vs_demand.png", p5, width = 9, height = 5, dpi = 120)
+p5
+```
+
+**Outcome:** the relationship is a descriptive association only. It cannot be read
+as a surge effect because platforms' multipliers, driver supply and rejected
+requests are unobserved.
+
+# 9. Predictive analysis
+
+## 9.1 Feature engineering
+
+Features use only information available **at the end of hour *t*** to predict hour
+*t + 1* (no leakage).
+
+```{r features}
+holidays <- as.Date(c("2024-01-01", "2024-01-15"))   # New Year's Day, MLK Day
+
+feat <- grid %>%
+  arrange(pulocationid, ts) %>%
+  group_by(pulocationid) %>%
+  mutate(
+    y        = lead(trips, 1),          # target: next-hour trips
+    lag0     = trips,                   # current hour
+    lag1     = lag(trips, 1),
+    lag2     = lag(trips, 2),
+    lag24    = lag(trips, 24),
+    lag167   = lag(trips, 167),         # hour t+1 one week earlier = t - 167
+    roll3    = (trips + lag(trips, 1) + lag(trips, 2)) / 3
+  ) %>%
+  ungroup() %>%
+  mutate(
+    target_ts = ts + 3600,
+    hour_t1   = hour(target_ts),
+    wd_t1     = wday(target_ts, week_start = 1),
+    weekend   = as.integer(wd_t1 >= 6),
+    holiday   = as.integer(as.Date(target_ts, tz = "America/New_York") %in% holidays),
+    zone      = factor(pulocationid)
+  ) %>%
+  filter(!is.na(y), !is.na(lag167))     # needs a week of history
+
+split_ts <- as.POSIXct("2024-01-18 00:00:00", tz = "America/New_York")
+train <- feat %>% filter(target_ts <  split_ts)
+test  <- feat %>% filter(target_ts >= split_ts)
+cat("Training rows:", nrow(train), "| Test rows:", nrow(test), "\n")
+cat("Training targets:", format(min(train$target_ts)), "to", format(max(train$target_ts)), "\n")
+cat("Test targets:    ", format(min(test$target_ts)),  "to", format(max(test$target_ts)), "\n")
+```
+
+The split is **chronological** (train on earlier days, test on 18–21 January) to
+mimic real forecasting.
+
+## 9.2 Baselines and models
+
+```{r models}
+rmse <- function(a, p) sqrt(mean((a - p)^2))
+mae  <- function(a, p) mean(abs(a - p))
+
+# Baselines
+test$pred_last_hour <- test$lag0        # "same as the hour just ended"
+test$pred_last_week <- test$lag167      # "same hour one week ago"
+
+# Linear model on log scale (stable for count data with a long right tail)
+form <- log1p(y) ~ log1p(lag0) + log1p(lag1) + log1p(lag2) + log1p(lag24) +
+  log1p(lag167) + log1p(roll3) + factor(hour_t1) + factor(wd_t1) + holiday + zone
+m_lm <- lm(form, data = train)
+test$pred_lm <- pmax(expm1(predict(m_lm, newdata = test)), 0)
+
+# Random forest, if the 'ranger' package can be installed
+use_rf <- requireNamespace("ranger", quietly = TRUE) ||
+  tryCatch({ install.packages("ranger", repos = "https://cloud.r-project.org"); TRUE },
+           error = function(e) FALSE)
+if (use_rf && requireNamespace("ranger", quietly = TRUE)) {
+  m_rf <- ranger::ranger(
+    y ~ lag0 + lag1 + lag2 + lag24 + lag167 + roll3 + hour_t1 + wd_t1 + holiday + pulocationid,
+    data = train, num.trees = 300, importance = "impurity", seed = 2024)
+  test$pred_rf <- pmax(predict(m_rf, data = test)$predictions, 0)
+} else {
+  use_rf <- FALSE
+}
+```
+
+## 9.3 Out-of-sample accuracy
+
+```{r accuracy}
+preds <- c("Last hour (baseline)" = "pred_last_hour",
+           "Same hour last week (baseline)" = "pred_last_week",
+           "Linear model (log)" = "pred_lm",
+           if (use_rf) c("Random forest" = "pred_rf"))
+
+acc <- tibble(
+  Model = names(preds),
+  RMSE  = sapply(preds, function(p) rmse(test$y, test[[p]])),
+  MAE   = sapply(preds, function(p) mae(test$y, test[[p]])),
+  `Skill vs best baseline (RMSE)` = NA_real_
+)
+best_base <- min(acc$RMSE[1:2])
+acc$`Skill vs best baseline (RMSE)` <- scales::percent(1 - acc$RMSE / best_base, accuracy = 0.1)
+acc[1:2, "Skill vs best baseline (RMSE)"] <- NA
+acc %>% mutate(across(c(RMSE, MAE), ~ round(.x, 2)))
+```
+
+```{r acc-plot}
+best_model <- acc$Model[which.min(acc$RMSE)]
+best_col   <- preds[best_model]
+
+p6 <- test %>%
+  group_by(target_ts) %>%
+  summarise(Actual = sum(y), Predicted = sum(.data[[best_col]]), Baseline = sum(pred_last_week), .groups = "drop") %>%
+  pivot_longer(-target_ts) %>%
+  ggplot(aes(target_ts, value, colour = name)) + geom_line() +
+  scale_y_continuous(labels = comma) +
+  labs(title = paste("Held-out period: citywide actual vs predicted next-hour trips —", best_model),
+       x = NULL, y = "Trips per hour", colour = NULL) + theme_minimal()
+ggsave("outputs/figures/06_forecast_vs_actual.png", p6, width = 9, height = 5, dpi = 120)
+p6
+```
+
+```{r rel-error}
+rel <- test %>%
+  mutate(pred = .data[[best_col]]) %>%
+  group_by(pulocationid) %>%
+  summarise(actual = sum(y), wape = sum(abs(y - pred)) / sum(y), .groups = "drop") %>%
+  arrange(desc(actual))
+cat(sprintf("Volume-weighted absolute percentage error across zones (best model): %.1f%%\n",
+            100 * sum(abs(test$y - test[[best_col]])) / sum(test$y)))
+```
+
+## 9.4 What drives the forecast?
+
+```{r importance}
+if (use_rf) {
+  imp <- sort(m_rf$variable.importance, decreasing = TRUE)
+  imp_df <- tibble(Feature = names(imp), Importance = as.numeric(imp))
+  p7 <- ggplot(imp_df, aes(fct_reorder(Feature, Importance), Importance)) +
+    geom_col(fill = "#9467bd") + coord_flip() +
+    labs(title = "Random forest variable importance", x = NULL) + theme_minimal()
+  ggsave("outputs/figures/07_importance.png", p7, width = 8, height = 5, dpi = 120)
+  p7
+}
+```
+
+## 9.5 Prescriptive step: a transparent driver-positioning rule
+
+**Rule:** at the end of each hour, advise idle drivers to move to the **K zones
+with the highest forecast demand for the next hour**. Performance is the share of
+actual next-hour trips (among modelled zones) that fall inside the recommended K
+zones. This is compared with applying the same rule to the baselines and to a
+random choice.
+
+```{r rule}
+K <- 10
+rule_eval <- function(col) {
+  test %>%
+    group_by(target_ts) %>%
+    mutate(rk = rank(-.data[[col]], ties.method = "first")) %>%
+    summarise(capture = sum(y[rk <= K]) / sum(y), .groups = "drop") %>%
+    summarise(mean_capture = mean(capture)) %>% pull()
+}
+oracle <- test %>% group_by(target_ts) %>%
+  mutate(rk = rank(-y, ties.method = "first")) %>%
+  summarise(capture = sum(y[rk <= K]) / sum(y)) %>% summarise(m = mean(capture)) %>% pull()
+random_capture <- K / length(top_zones)
+
+rule_tbl <- tibble(
+  Strategy = c(names(preds), "Perfect foresight (upper bound)", "Random K zones"),
+  `Mean share of next-hour trips captured` =
+    c(sapply(preds, rule_eval), oracle, random_capture)
+) %>% mutate(`Mean share of next-hour trips captured` =
+               scales::percent(`Mean share of next-hour trips captured`, accuracy = 0.1))
+rule_tbl
+```
+
+**Outcome:** see the table. A forecast is useful for positioning only if the
+model's capture rate is clearly above the random rate and close to the
+perfect-foresight bound; the gap between the model and the baselines shows
+whether modelling adds value beyond simple heuristics.
+
+# 10. Results summary
+
+```{r summary, echo=FALSE}
+best_row <- acc[which.min(acc$RMSE), ]
+cat(sprintf(paste0(
+  "* Best model on the held-out days: **%s** (RMSE %.1f, MAE %.1f trips per zone-hour).\n",
+  "* Best baseline RMSE: %.1f, so the model's RMSE is %.1f%% %s.\n",
+  "* Volume-weighted error across zones: %.1f%%.\n",
+  "* Top-%d positioning rule capture rates are in Section 9.5.\n"),
+  best_row$Model, best_row$RMSE, best_row$MAE, best_base,
+  abs(100 * (1 - best_row$RMSE / best_base)),
+  ifelse(best_row$RMSE < best_base, "lower", "higher"),
+  100 * sum(abs(test$y - test[[best_col]])) / sum(test$y), K))
+```
+
+**Answer to the research question.** Read the numbers above against the success
+criteria in Section 3: the question is answered "yes" only if the best model beats
+**both** baselines on RMSE and MAE *and* the positioning rule captures more demand
+than the baseline-based rule. If it does not, the honest conclusion is that simple
+persistence already captures most of the predictable signal in a three-week sample.
+
+# 11. Limitations and threats to validity
+
+* **Short window (three weeks of one winter month):** seasonality, school terms,
+  weather and events are not represented; results should not be extrapolated to
+  other months.
+* **Demand is fulfilled demand:** cancelled and unmatched requests are not
+  recorded, so true demand is under-counted when supply is tight.
+* **No surge multiplier, no supply data:** surge-pricing effects cannot be
+  estimated or causally interpreted with this dataset.
+* **Zone-level aggregation:** hides within-zone variation.
+* **Holiday handling is minimal:** only two flagged dates; a hold-out of four
+  days is small for a robust performance estimate.
+* **Only the top zones are modelled:** low-volume zones have noisy counts and are
+  excluded from model evaluation.
+* **Provider mix:** all high-volume providers are pooled together.
+
+# 12. Next steps (remaining analytics types)
+
+| Stage | Analytics type | Question | Data needed |
+|---|---|---|---|
+| 2 | Diagnostic | Which factors (hour, weather, events, borough, holiday) explain unusually high demand spikes? | HVFHV + hourly NOAA weather (Central Park station) + NYC event calendar |
+| 3 | Descriptive (extended) | How did demand patterns change across months of 2024? | More months of the same HVFHV dataset |
+| 4 | Prescriptive | What is the optimal dispatch / repositioning policy given forecasts and cost of driving empty? | Forecasts from this notebook + trip distance/time data + assumptions on driver supply |
+| 5 | Surge analysis | Do price levels respond to demand pressure? | A dataset with explicit multipliers or price quotes (not in the TLC release); otherwise restrict to fare-per-mile analysis |
+
+# 13. Master activity log
+
+| # | Activity | Where recorded | Outcome |
+|---|---|---|---|
+| 1 | Selected analytics type | Section 2 | Predictive analytics first |
+| 2 | Framed question | Section 3 | Next-hour zone demand forecast vs baselines |
+| 3 | Specified datasets | Section 4 | HVFHV trips, TLC zone lookup, holiday calendar |
+| 4 | Data-access plan | Section 5 | SODA API, server-side aggregation, cache |
+| 5 | Executed data access | Section 6 | See activity log table (rows, trips, zones) |
+| 6 | Quality checks | Section 7 | Duplicates, negatives, missing IDs, series continuity |
+| 7 | Descriptive groundwork | Section 8 | Hourly profile, time series, top zones, heatmap, price indicator |
+| 8 | Modelling and evaluation | Section 9 | Baselines vs linear model vs random forest, chronological hold-out |
+| 9 | Decision rule | Section 9.5 | Top-K positioning rule evaluated against baselines |
+| 10 | Limitations and next steps | Sections 11–12 | Documented |
+
+# 14. Reproducibility
+
+```{r session}
+sessionInfo()
+```
+
+**Sources**
+
+* NYC TLC Trip Record Data: https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page
+* 2024 High Volume FHV Trip Data (NYC Open Data): https://data.cityofnewyork.us/Transportation/2024-High-Volume-FHV-Trip-Data/bqxa-629f
+* HVFHV data dictionary: https://home4.nyc.gov/assets/tlc/downloads/pdf/data_dictionary_trip_records_hvfhs.pdf
+* TLC Taxi Zone Lookup: https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv

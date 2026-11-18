@@ -1,7 +1,12 @@
+# Temporary data / processing folders
 data/raw/
 data/processed/
-outputs/figures/*.png
-*.html
+
+# R session & environment files
 .Rhistory
 .RData
 .Rproj.user/
+.Ruserdata/
+
+# Generated HTML reports (knit locally in RStudio)
+*.html
