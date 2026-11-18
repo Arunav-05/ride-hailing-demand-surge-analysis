@@ -75,6 +75,8 @@ The sample window is intentionally bounded for classroom reproducibility. It is 
 
 # 3. Setup and reproducibility
 
+The repository includes a GitHub Actions workflow that attempts to render this notebook on pushes to the main branch.
+
 ```{r setup, message=FALSE, warning=FALSE}
 required <- c("httr2", "jsonlite", "dplyr", "tidyr", "lubridate",
               "ggplot2", "knitr", "scales", "ranger", "slider", "tibble")
