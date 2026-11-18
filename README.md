@@ -183,5 +183,4 @@ ride-hailing-demand-surge-analysis/
 - **Student Name:** Arunav
 - **GitHub Repository URL:** `https://github.com/Arunav-05/ride-hailing-demand-surge-analysis`
 - **Submission Form:** Submitted via `https://forms.gle/ctRk3p9wuCav1za9A`
-- **Submission Deadline:** August 6, 2026 at 11:59 PM
-- **Course Evaluator Access:** If the repository is set to private, collaborator access is granted to `datta_subhajit@yahoo.com`.
+
