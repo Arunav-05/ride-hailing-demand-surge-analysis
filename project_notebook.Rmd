@@ -363,21 +363,28 @@ latest_hour <- max(panel$hour)
 next_hour <- latest_hour + lubridate::hours(1)
 future_rows <- panel |>
   dplyr::filter(hour == latest_hour) |>
-  dplyr::group_by(pickup_zone) |>
-  dplyr::summarise(
-    pickup_zone = dplyr::first(pickup_zone),
+  dplyr::transmute(
+    pickup_zone,
     hour_of_day = lubridate::hour(next_hour),
     weekday = factor(lubridate::wday(next_hour, label = TRUE, week_start = 1),
                      levels = levels(panel$weekday)),
     weekend = as.integer(lubridate::wday(next_hour, week_start = 1) >= 6),
-    lag_1 = dplyr::first(trips),
-    lag_24 = dplyr::first(lag_1),
-    rolling_24 = mean(c(dplyr::first(trips),
-                       panel$trips[panel$pickup_zone == dplyr::first(pickup_zone) &
-                                   panel$hour >= latest_hour - lubridate::hours(23) &
-                                   panel$hour < latest_hour]), na.rm = TRUE),
-    .groups = "drop"
+    lag_1 = trips
   ) |>
+  dplyr::left_join(
+    panel |>
+      dplyr::filter(hour == latest_hour - lubridate::hours(23)) |>
+      dplyr::transmute(pickup_zone, lag_24 = trips),
+    by = "pickup_zone"
+  ) |>
+  dplyr::left_join(
+    panel |>
+      dplyr::filter(hour > latest_hour - lubridate::hours(24), hour <= latest_hour) |>
+      dplyr::group_by(pickup_zone) |>
+      dplyr::summarise(rolling_24 = mean(trips), .groups = "drop"),
+    by = "pickup_zone"
+  ) |>
+  dplyr::mutate(lag_24 = tidyr::replace_na(lag_24, 0)) |>
   dplyr::select(dplyr::all_of(features))
 latest_forecast <- predict(rf_model, data = future_rows)$predictions
 positioning <- tibble::tibble(
