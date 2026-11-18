@@ -25,7 +25,7 @@ The TLC dataset is not a complete platform marketplace feed. It does not include
 
 ## Run
 
-Requires R 4.2+ and internet access. Open `project_notebook.Rmd` in RStudio and Knit to HTML. The notebook installs missing packages, downloads a bounded public API sample, performs quality checks, creates plots, trains/evaluates a model and records extraction and analysis outcomes. Raw data and generated HTML are not committed.
+Requires R 4.2+ and internet access. Open `project_notebook.Rmd` in RStudio and Knit to HTML. The notebook installs missing packages, downloads a bounded public API sample (up to 5 million records, with an explicit warning if the safety ceiling is reached), performs quality checks, creates plots, trains/evaluates a model and records extraction and analysis outcomes. Raw data and generated HTML are not committed. Rendering is manual in RStudio; no GitHub Actions workflow is used.
 
 ## Repository structure
 
